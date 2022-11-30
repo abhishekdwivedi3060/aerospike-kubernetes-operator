@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -167,8 +168,6 @@ func (c *AerospikeCluster) validate(aslog logr.Logger) error {
 		return fmt.Errorf("invalid cluster size 0")
 	}
 
-	configMap := c.Spec.AerospikeConfig
-
 	// Validate Image version
 	version, err := GetImageVersion(c.Spec.Image)
 	if err != nil {
@@ -196,36 +195,37 @@ func (c *AerospikeCluster) validate(aslog logr.Logger) error {
 		return err
 	}
 
-	// Validate if passed aerospikeConfig
-	if err := validateAerospikeConfigSchema(
-		aslog, version, *configMap,
-	); err != nil {
-		return fmt.Errorf("aerospikeConfig not valid: %v", err)
-	}
+	for _, rack := range c.Spec.RackConfig.Racks {
+		// Storage should be validated before validating aerospikeConfig and fileStorage
+		if err := validateStorage(&rack.Storage, &c.Spec.PodSpec); err != nil {
+			return err
+		}
 
-	// Validate common aerospike config
-	if err := c.validateAerospikeConfig(
-		configMap, &c.Spec.Storage, int(c.Spec.Size),
-	); err != nil {
-		return err
-	}
+		// Validate if passed aerospikeConfig
+		if err := validateAerospikeConfigSchema(
+			aslog, version, rack.AerospikeConfig,
+		); err != nil {
+			return fmt.Errorf("aerospikeConfig not valid: %v", err)
+		}
 
-	if err := validateClientCertSpec(
-		c.Spec.OperatorClientCertSpec, configMap,
-	); err != nil {
-		return err
-	}
+		// Validate common aerospike config
+		if err := c.validateAerospikeConfig(
+			&rack.AerospikeConfig, &rack.Storage, int(c.Spec.Size),
+		); err != nil {
+			return err
+		}
 
-	if err := validateRequiredFileStorageForMetadata(
-		*configMap, &c.Spec.Storage, c.Spec.ValidationPolicy, version,
-	); err != nil {
-		return err
-	}
+		if err := validateRequiredFileStorageForMetadata(
+			rack.AerospikeConfig, &rack.Storage, c.Spec.ValidationPolicy, version,
+		); err != nil {
+			return err
+		}
 
-	if err := validateRequiredFileStorageForFeatureConf(
-		*configMap, &c.Spec.Storage,
-	); err != nil {
-		return err
+		if err := validateRequiredFileStorageForFeatureConf(
+			rack.AerospikeConfig, &rack.Storage,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Validate resource and limit
@@ -240,6 +240,12 @@ func (c *AerospikeCluster) validate(aslog logr.Logger) error {
 
 	// Validate rackConfig
 	if err := c.validateRackConfig(aslog); err != nil {
+		return err
+	}
+
+	if err := validateClientCertSpec(
+		c.Spec.OperatorClientCertSpec, c.Spec.AerospikeConfig,
+	); err != nil {
 		return err
 	}
 
@@ -368,18 +374,40 @@ func (c *AerospikeCluster) validateAccessControl(_ logr.Logger) error {
 }
 
 func (c *AerospikeCluster) validatePodSpecResourceAndLimits(_ logr.Logger) error {
-	if err := c.validateResourceAndLimits(c.Spec.PodSpec.AerospikeContainerSpec.Resources); err != nil {
+
+	checkResourcesLimits := false
+
+	if err := c.validateResourceAndLimits(c.Spec.PodSpec.AerospikeContainerSpec.Resources, checkResourcesLimits); err != nil {
 		return err
 	}
 
+	for _, rack := range c.Spec.RackConfig.Racks {
+		if rack.Storage.CleanupThreads != AerospikeVolumeSingleCleanupThread {
+			checkResourcesLimits = true
+			break
+		}
+	}
+
+	if checkResourcesLimits && c.Spec.PodSpec.AerospikeInitContainerSpec == nil {
+		return fmt.Errorf(
+			"init container spec should have resources.Limits set if CleanupThreads is more than 1",
+		)
+	}
 	if c.Spec.PodSpec.AerospikeInitContainerSpec != nil {
-		return c.validateResourceAndLimits(c.Spec.PodSpec.AerospikeInitContainerSpec.Resources)
+		return c.validateResourceAndLimits(c.Spec.PodSpec.AerospikeInitContainerSpec.Resources, checkResourcesLimits)
 	}
 	return nil
 }
 
-func (c *AerospikeCluster) validateResourceAndLimits(resources *v1.ResourceRequirements) error {
-	if resources == nil {
+func (c *AerospikeCluster) validateResourceAndLimits(resources *v1.ResourceRequirements, checkResourcesLimits bool) error {
+
+	if checkResourcesLimits {
+		if resources == nil || resources.Limits == nil {
+			return fmt.Errorf(
+				"resources.Limits for init container cannot be empty if CleanupThreads is being set more than 1",
+			)
+		}
+	} else if resources == nil {
 		return nil
 	}
 
@@ -407,11 +435,6 @@ func (c *AerospikeCluster) validateRackConfig(aslog logr.Logger) error {
 		}
 	}
 
-	version, err := GetImageVersion(c.Spec.Image)
-	if err != nil {
-		return err
-	}
-
 	rackMap := map[int]bool{}
 	for _, rack := range c.Spec.RackConfig.Racks {
 		// Check for duplicate
@@ -433,7 +456,9 @@ func (c *AerospikeCluster) validateRackConfig(aslog logr.Logger) error {
 		}
 
 		if rack.InputAerospikeConfig != nil {
-			if _, ok := rack.InputAerospikeConfig.Value["network"]; ok {
+			_, inputRackNetwork := rack.InputAerospikeConfig.Value["network"]
+			_, inputRackSecurity := rack.InputAerospikeConfig.Value["security"]
+			if inputRackNetwork || inputRackSecurity {
 				// Aerospike K8s Operator doesn't support different network configurations for different racks.
 				// I.e.
 				//    - the same heartbeat port (taken from current node) is used for all peers regardless to racks.
@@ -441,36 +466,77 @@ func (c *AerospikeCluster) validateRackConfig(aslog logr.Logger) error {
 				//    - we need to refactor how connection is created to AS to take into account rack's network config.
 				// So, just reject rack specific network connections for now.
 				return fmt.Errorf(
-					"you can't specify network configuration for rack %d (network should be the same for all racks)",
+					"you can't specify network or security configuration for rack %d (network and security should be the same for all racks)",
 					rack.ID,
 				)
 			}
 		}
+	}
 
-		config := rack.AerospikeConfig
+	// Validate batch upgrade/restart param
+	if c.Spec.RackConfig.RollingUpdateBatchSize != nil {
 
-		if len(rack.AerospikeConfig.Value) != 0 || len(rack.Storage.Volumes) != 0 {
-			// TODO:
-			// Replication-factor in rack and commonConfig can not be different
-			storage := rack.Storage
-			if err := c.validateAerospikeConfig(
-				&config, &storage, int(c.Spec.Size),
-			); err != nil {
-				return err
-			}
+		// Just validate if RollingUpdateBatchSize is valid number or string.
+		randomNumber := 100
+		count, err := intstr.GetScaledValueFromIntOrPercent(c.Spec.RackConfig.RollingUpdateBatchSize, randomNumber, false)
+		if err != nil {
+			return err
+		}
+		// Only negative is not allowed. Any big number can be given.
+		if count < 0 {
+			return fmt.Errorf("can not use negative rackConfig.RollingUpdateBatchSize  %s", c.Spec.RackConfig.RollingUpdateBatchSize.String())
 		}
 
-		// Validate rack aerospike config
-		if len(rack.AerospikeConfig.Value) != 0 {
-			if err := validateAerospikeConfigSchema(
-				aslog, version, config,
-			); err != nil {
-				return fmt.Errorf("aerospikeConfig not valid for rack %v", rack)
+		if len(c.Spec.RackConfig.Racks) < 2 {
+			return fmt.Errorf("can not use rackConfig.RollingUpdateBatchSize when number of racks is less than two")
+		}
+
+		nsConfsNamespaces := c.getNsConfsForNamespaces()
+		for ns, nsConf := range nsConfsNamespaces {
+			if !isNameExist(c.Spec.RackConfig.Namespaces, ns) {
+				return fmt.Errorf("can not use rackConfig.RollingUpdateBatchSize when there is any non-rack enabled namespace %s", ns)
+			}
+
+			if nsConf.noOfRacksForNamespaces <= 1 {
+				return fmt.Errorf("can not use rackConfig.RollingUpdateBatchSize when namespace `%s` is configured in only one rack", ns)
+			}
+			if nsConf.replicationFactor <= 1 {
+				return fmt.Errorf("can not use rackConfig.RollingUpdateBatchSize when namespace `%s` is configured with replication-factor 1", ns)
 			}
 		}
 	}
 
+	// TODO: should not use batch if racks are less than replication-factor
 	return nil
+}
+
+type nsConf struct {
+	noOfRacksForNamespaces int
+	replicationFactor      int
+}
+
+func (c *AerospikeCluster) getNsConfsForNamespaces() map[string]nsConf {
+	nsConfs := map[string]nsConf{}
+	for _, rack := range c.Spec.RackConfig.Racks {
+		nsList := rack.AerospikeConfig.Value["namespaces"].([]interface{})
+		for _, nsInterface := range nsList {
+			nsName := nsInterface.(map[string]interface{})["name"].(string)
+
+			var noOfRacksForNamespaces int
+			if _, ok := nsConfs[nsName]; !ok {
+				noOfRacksForNamespaces = 1
+			} else {
+				noOfRacksForNamespaces = nsConfs[nsName].noOfRacksForNamespaces + 1
+			}
+
+			rf, _ := getNamespaceReplicationFactor(nsInterface.(map[string]interface{}))
+			nsConfs[nsName] = nsConf{
+				noOfRacksForNamespaces: noOfRacksForNamespaces,
+				replicationFactor:      rf,
+			}
+		}
+	}
+	return nsConfs
 }
 
 //******************************************************************************
@@ -953,42 +1019,36 @@ func validateNamespaceConfig(
 func validateNamespaceReplicationFactor(
 	nsConf map[string]interface{}, clSize int,
 ) error {
-	// Validate replication-factor with cluster size only at the time of deployment
+	rf, err := getNamespaceReplicationFactor(nsConf)
+	if err != nil {
+		return err
+	}
+	if clSize < rf {
+		return fmt.Errorf("namespace replication-factor %v cannot be more than cluster size %d", rf, clSize)
+	}
+
+	return nil
+}
+
+func getNamespaceReplicationFactor(nsConf map[string]interface{}) (int, error) {
 	rfInterface, ok := nsConf["replication-factor"]
 	if !ok {
 		rfInterface = 2 // default replication-factor
 	}
 
-	if rf, ok := rfInterface.(int64); ok {
-		if int64(clSize) < rf {
-			return fmt.Errorf(
-				"namespace replication-factor %v cannot be more than cluster size %d",
-				rf, clSize,
-			)
-		}
-	} else if rf, ok := rfInterface.(int); ok {
-		if clSize < rf {
-			return fmt.Errorf(
-				"namespace replication-factor %v cannot be more than cluster size %d",
-				rf, clSize,
-			)
-		}
-	} else if rf, ok := rfInterface.(float64); ok {
-		// Values of yaml are getting parsed in float64 in the new scheme
-		if float64(clSize) < rf {
-			return fmt.Errorf(
-				"namespace replication-factor %v cannot be more than cluster size %d",
-				rf, clSize,
-			)
-		}
-	} else {
-		return fmt.Errorf(
-			"namespace replication-factor %v not valid int or int64",
-			rfInterface,
+	switch rf := rfInterface.(type) {
+	case int64:
+		return int(rf), nil
+	case int:
+		return rf, nil
+	case float64:
+		return int(rf), nil
+	default:
+		return 0, fmt.Errorf(
+			"namespace replication-factor %v not valid int, int64 or float64",
+			rf,
 		)
 	}
-
-	return nil
 }
 
 func validateLoadBalancerUpdate(
