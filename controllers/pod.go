@@ -145,29 +145,17 @@ func (r *SingleClusterReconciler) getRollingRestartTypePod(
 	return restartType
 }
 
-func (r *SingleClusterReconciler) rollingRestartPods(
-	rackState *RackState, podsToRestart []*corev1.Pod, ignorablePods []corev1.Pod,
-	restartTypeMap map[string]RestartType,
-) reconcileResult {
-	failedPods, activePods := getFailedAndActivePods(podsToRestart)
-
+func (r *SingleClusterReconciler) rollingRestartPods(rackState *RackState, podsToRestart []*corev1.Pod,
+	ignorablePods []corev1.Pod, restartTypeMap map[string]RestartType, handleFailedPods bool) reconcileResult {
 	// If already dead node (failed pod) then no need to check node safety, migration
-	if len(failedPods) != 0 {
-		r.Log.Info("Restart failed pods", "pods", getPodNames(failedPods))
+	if !handleFailedPods {
+		r.Log.Info("Restart active pods", "pods", getPodNames(podsToRestart))
 
-		if res := r.restartPods(rackState, failedPods, restartTypeMap); !res.isSuccess {
-			return res
-		}
-	}
-
-	if len(activePods) != 0 {
-		r.Log.Info("Restart active pods", "pods", getPodNames(activePods))
-
-		if res := r.waitForMultipleNodesSafeStopReady(activePods, ignorablePods, false); !res.isSuccess {
+		if res := r.waitForMultipleNodesSafeStopReady(podsToRestart, ignorablePods, false); !res.isSuccess {
 			return res
 		}
 
-		if res := r.restartPods(rackState, activePods, restartTypeMap); !res.isSuccess {
+		if res := r.restartPods(rackState, podsToRestart, restartTypeMap); !res.isSuccess {
 			return res
 		}
 	}
@@ -359,28 +347,17 @@ func getFailedAndActivePods(pods []*corev1.Pod) (failedPods, activePods []*corev
 	return failedPods, activePods
 }
 
-func (r *SingleClusterReconciler) safelyDeletePodsAndEnsureImageUpdated(
-	rackState *RackState, podsToUpdate []*corev1.Pod, ignorablePods []corev1.Pod,
-) reconcileResult {
-	failedPods, activePods := getFailedAndActivePods(podsToUpdate)
-
+func (r *SingleClusterReconciler) safelyDeletePodsAndEnsureImageUpdated(rackState *RackState,
+	podsToUpdate []*corev1.Pod, ignorablePods []corev1.Pod, handleFailedPods bool) reconcileResult {
 	// If already dead node (failed pod) then no need to check node safety, migration
-	if len(failedPods) != 0 {
-		r.Log.Info("Restart failed pods with updated container image", "pods", getPodNames(failedPods))
+	if !handleFailedPods {
+		r.Log.Info("Restart active pods with updated container image", "pods", getPodNames(podsToUpdate))
 
-		if res := r.deletePodAndEnsureImageUpdated(rackState, failedPods); !res.isSuccess {
-			return res
-		}
-	}
-
-	if len(activePods) != 0 {
-		r.Log.Info("Restart active pods with updated container image", "pods", getPodNames(activePods))
-
-		if res := r.waitForMultipleNodesSafeStopReady(activePods, ignorablePods, false); !res.isSuccess {
+		if res := r.waitForMultipleNodesSafeStopReady(podsToUpdate, ignorablePods, false); !res.isSuccess {
 			return res
 		}
 
-		if res := r.deletePodAndEnsureImageUpdated(rackState, activePods); !res.isSuccess {
+		if res := r.deletePodAndEnsureImageUpdated(rackState, podsToUpdate); !res.isSuccess {
 			return res
 		}
 	}
@@ -705,9 +682,9 @@ func (r *SingleClusterReconciler) getClusterPodList() (
 	return podList, nil
 }
 
-func (r *SingleClusterReconciler) isAnyPodInImageFailedState(podList []corev1.Pod) bool {
+func (r *SingleClusterReconciler) isAnyPodInImageFailedState(podList []*corev1.Pod) bool {
 	for idx := range podList {
-		pod := &podList[idx]
+		pod := podList[idx]
 		// TODO: Should we use checkPodFailed or CheckPodImageFailed?
 		// scaleDown, rollingRestart should work even if node is crashed
 		// If node was crashed due to wrong config then only rollingRestart can bring it back.
